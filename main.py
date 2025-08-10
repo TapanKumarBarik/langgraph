@@ -1,4 +1,5 @@
 # main.py
+
 import asyncio
 import logging
 import json
@@ -11,7 +12,6 @@ import structlog
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, validator
 import uvicorn
 
 from langgraph.graph import StateGraph, END
@@ -51,46 +51,54 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-# Pydantic Models
-class ChatMessage(BaseModel):
-    role: str = Field(..., regex="^(user|assistant|system)$")
-    content: str = Field(..., min_length=1, max_length=10000)
-    timestamp: Optional[datetime] = None
-    metadata: Optional[Dict[str, Any]] = None
 
-class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=10000)
-    user_id: str = Field(..., min_length=1, max_length=100)
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Union
+from datetime import datetime
+from langchain.schema import BaseMessage
+
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+    timestamp: Optional[datetime] = field(default_factory=datetime.utcnow)
+    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+@dataclass
+class ChatRequest:
+    message: str
+    user_id: str
     conversation_id: Optional[str] = None
-    context: Optional[Dict[str, Any]] = {}
-    
-    @validator('message')
-    def validate_message(cls, v):
-        return validate_input(v)
+    context: Optional[Dict[str, Any]] = field(default_factory=dict)
 
-class ChatResponse(BaseModel):
+@dataclass
+class ChatResponse:
     response: str
     conversation_id: str
     agent_used: str
-    sources: List[Dict[str, Any]] = []
-    images: List[str] = []
-    followup_suggestions: List[str] = []
-    metadata: Dict[str, Any] = {}
+    sources: List[Dict[str, Any]] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
+    followup_suggestions: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
-class AgentState(BaseModel):
-    messages: List[BaseMessage] = []
-    user_id: str
-    conversation_id: str
-    context: Dict[str, Any] = {}
+@dataclass
+class AgentState:
+    messages: List[BaseMessage] = field(default_factory=list)
+    user_id: str = ""
+    conversation_id: str = ""
+    context: Dict[str, Any] = field(default_factory=dict)
     current_agent: Optional[str] = None
-    search_results: List[Dict[str, Any]] = []
-    sql_results: List[Dict[str, Any]] = []
-    images: List[str] = []
-    sources: List[Dict[str, Any]] = []
-    followup_suggestions: List[str] = []
+    search_results: List[Dict[str, Any]] = field(default_factory=list)
+    sql_results: List[Dict[str, Any]] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
+    sources: List[Dict[str, Any]] = field(default_factory=list)
+    followup_suggestions: List[str] = field(default_factory=list)
     retry_count: int = 0
     error_message: Optional[str] = None
-
+    
+    
+    
 # Global services
 settings = Settings()
 memory_service: Optional[ConversationMemoryService] = None
@@ -167,9 +175,8 @@ app.add_middleware(
 
 class MultiAgentOrchestrator:
     def __init__(self):
-        # Initialize LLM based on configuration
+        # Initialize LLM immediately
         if settings.OPENAI_API_TYPE == "openai":
-            # For local LLM servers (like Ollama, LM Studio, etc.)
             from langchain_openai import ChatOpenAI
             self.llm = ChatOpenAI(
                 base_url=settings.AZURE_OPENAI_ENDPOINT,
@@ -179,7 +186,6 @@ class MultiAgentOrchestrator:
                 max_tokens=2000
             )
         else:
-            # For Azure OpenAI
             self.llm = AzureChatOpenAI(
                 azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
                 api_key=settings.AZURE_OPENAI_API_KEY,
@@ -189,18 +195,42 @@ class MultiAgentOrchestrator:
                 max_tokens=2000
             )
         
-        # Initialize agents
-        self.coordinator_agent = CoordinatorAgent(self.llm)
-        self.search_agent = SearchAgent(self.llm, azure_search)
-        self.sql_agent = SQLAgent(self.llm, azure_sql)
-        
-        if settings.ENABLE_FOLLOWUP_SUGGESTIONS:
-            self.followup_agent = FollowupAgent(self.llm)
-        else:
-            self.followup_agent = None
-        
-        # Build the graph
-        self.graph = self._build_graph()
+        # Initialize agent attributes but don't create agents yet
+        self._coordinator_agent = None
+        self._search_agent = None
+        self._sql_agent = None
+        self._followup_agent = None
+        self._graph = None
+    
+    @property
+    def coordinator_agent(self):
+        if self._coordinator_agent is None:
+            self._coordinator_agent = CoordinatorAgent(self.llm)
+        return self._coordinator_agent
+    
+    @property
+    def search_agent(self):
+        if self._search_agent is None and azure_search is not None:
+            self._search_agent = SearchAgent(self.llm, azure_search)
+        return self._search_agent
+    
+    @property
+    def sql_agent(self):
+        if self._sql_agent is None and azure_sql is not None:
+            self._sql_agent = SQLAgent(self.llm, azure_sql)
+        return self._sql_agent
+
+    @property
+    def followup_agent(self):
+        if self._followup_agent is None:
+            self._followup_agent = FollowupAgent(self.llm)
+        return self._followup_agent
+
+    @property
+    def graph(self):
+        if self._graph is None:
+            self._graph = self._build_graph()
+        return self._graph
     
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(AgentState)
@@ -351,12 +381,18 @@ class MultiAgentOrchestrator:
             # Followup errors are non-critical
             state.followup_suggestions = []
             return state
+
     
+    @retry_with_exponential_backoff(max_retries=3)
     async def _response_node(self, state: AgentState) -> AgentState:
         try:
             logger.info("Response node processing", conversation_id=state.conversation_id)
             
-            if state.error_message:
+            if not state.messages:
+                logger.error("No messages in state")
+                state.error_message = "No messages found in conversation"
+                response_content = "I apologize, but I encountered an error while processing your request. Please try again."
+            elif state.error_message:
                 response_content = "I apologize, but I encountered an error while processing your request. Please try again."
             elif state.current_agent == "out_of_scope":
                 response_content = "I'm sorry, but your question is outside my scope of knowledge. I can only help with information from our search index and database."
@@ -373,19 +409,20 @@ class MultiAgentOrchestrator:
             ai_message = AIMessage(content=response_content)
             state.messages.append(ai_message)
             
-            # Save conversation to memory
-            await memory_service.save_conversation_turn(
-                user_id=state.user_id,
-                conversation_id=state.conversation_id,
-                human_message=state.messages[-2],
-                ai_message=ai_message,
-                metadata={
-                    "agent": state.current_agent,
-                    "sources": state.sources,
-                    "images": state.images,
-                    "environment": settings.ENVIRONMENT
-                }
-            )
+            # Save conversation to memory only if we have both human and AI messages
+            if len(state.messages) >= 2:
+                await memory_service.save_conversation_turn(
+                    user_id=state.user_id,
+                    conversation_id=state.conversation_id,
+                    human_message=state.messages[-2],
+                    ai_message=ai_message,
+                    metadata={
+                        "agent": state.current_agent,
+                        "sources": state.sources,
+                        "images": state.images,
+                        "environment": settings.ENVIRONMENT
+                    }
+                )
             
             return state
             
@@ -393,7 +430,6 @@ class MultiAgentOrchestrator:
             logger.error("Response node error", error=str(e))
             state.error_message = f"Response generation error: {str(e)}"
             return state
-    
     def _route_decision(self, state: AgentState) -> str:
         if state.error_message:
             return "error"
@@ -414,7 +450,7 @@ class MultiAgentOrchestrator:
         if state.images and settings.ENABLE_IMAGE_SUPPORT:
             image_note = f"\n\nNote: {len(state.images)} related image(s) have been found and included in the response."
         
-        prompt = f"""Based on the following search results, provide a comprehensive answer to the user's question: "{state.messages[-2].content}"
+        prompt = f"""Based on the following search results, provide a comprehensive answer to the user's question: "{state.messages[0].content}"
 
 Search Results:
 {context_docs}
@@ -457,63 +493,99 @@ Answer:"""
         response = await self.llm.ainvoke([HumanMessage(content=prompt)])
         return response.content
 
-# Initialize orchestrator
-orchestrator = MultiAgentOrchestrator()
+@app.middleware("http")
+async def initialize_orchestrator(request: Request, call_next):
+    if not hasattr(app.state, "orchestrator"):
+        if azure_search is None or azure_sql is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Services not initialized yet"
+            )
+        app.state.orchestrator = MultiAgentOrchestrator()
+    
+    return await call_next(request)
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(
-    request: ChatRequest,
-    background_tasks: BackgroundTasks
-) -> ChatResponse:
+@app.post("/chat")
+async def chat_endpoint(request: Request) -> Dict[str, Any]:
     """Main chat endpoint for conversational AI"""
     try:
+        orchestrator = app.state.orchestrator
+        # Parse request manually
+        body = await request.json()
+        
+        # Extract and validate required fields
+        message = body.get("message", "").strip()
+        user_id = body.get("user_id", "").strip()
+        conversation_id = body.get("conversation_id")
+        context = body.get("context", {})
+        
+        if not message or not user_id:
+            raise HTTPException(status_code=400, detail="message and user_id are required")
+        
         # Generate conversation ID if not provided
-        conversation_id = request.conversation_id or str(uuid.uuid4())
+        conversation_id = conversation_id or str(uuid.uuid4())
         
         logger.info("Chat request received", 
-                   user_id=request.user_id,
+                   user_id=user_id,
                    conversation_id=conversation_id,
-                   message_length=len(request.message),
+                   message_length=len(message),
                    environment=settings.ENVIRONMENT)
         
         # Create initial state
         state = AgentState(
-            messages=[HumanMessage(content=request.message)],
-            user_id=request.user_id,
+            messages=[HumanMessage(content=message)],
+            user_id=user_id,
             conversation_id=conversation_id,
-            context=request.context or {}
+            context=context,
         )
         
         # Process through the graph
         final_state = await orchestrator.graph.ainvoke(state)
-        
-        # Extract response
-        response_message = final_state.messages[-1].content
-        
+
+        # Extract response - handle both dict and dataclass returns
+        if hasattr(final_state, 'messages'):
+            # It's a dataclass
+            response_message = final_state.messages[-1].content
+            current_agent = final_state.current_agent
+            sources = final_state.sources
+            images = final_state.images
+            followup_suggestions = final_state.followup_suggestions
+            search_results = final_state.search_results
+            sql_results = final_state.sql_results
+        else:
+            # It's a dict (AddableValuesDict)
+            response_message = final_state['messages'][-1].content
+            current_agent = final_state.get('current_agent')
+            sources = final_state.get('sources', [])
+            images = final_state.get('images', [])
+            followup_suggestions = final_state.get('followup_suggestions', [])
+            search_results = final_state.get('search_results', [])
+            sql_results = final_state.get('sql_results', [])
+
         # Log successful completion
         logger.info("Chat request completed", 
-                   conversation_id=conversation_id,
-                   agent_used=final_state.current_agent,
-                   response_length=len(response_message),
-                   has_images=len(final_state.images) > 0,
-                   has_sources=len(final_state.sources) > 0)
-        
-        return ChatResponse(
-            response=response_message,
-            conversation_id=conversation_id,
-            agent_used=final_state.current_agent or "unknown",
-            sources=final_state.sources,
-            images=final_state.images if settings.ENABLE_IMAGE_SUPPORT else [],
-            followup_suggestions=final_state.followup_suggestions if settings.ENABLE_FOLLOWUP_SUGGESTIONS else [],
-            metadata={
+                conversation_id=conversation_id,
+                agent_used=current_agent,
+                response_length=len(response_message),
+                has_images=len(images) > 0,
+                has_sources=len(sources) > 0)
+
+        return {
+            "response": response_message,
+            "conversation_id": conversation_id,
+            "agent_used": current_agent or "unknown",
+            "sources": sources,
+            "images": images if settings.ENABLE_IMAGE_SUPPORT else [],
+            "followup_suggestions": followup_suggestions if settings.ENABLE_FOLLOWUP_SUGGESTIONS else [],
+            "metadata": {
                 "processing_time": datetime.utcnow().isoformat(),
-                "search_results_count": len(final_state.search_results),
-                "sql_results_count": len(final_state.sql_results),
+                "search_results_count": len(search_results),
+                "sql_results_count": len(sql_results),
                 "environment": settings.ENVIRONMENT,
                 "database_type": "AdventureWorks2022" if settings.USE_LOCAL_SQL else "Azure SQL"
             }
-        )
-        
+        }
+                
     except Exception as e:
         logger.error("Chat endpoint error", error=str(e))
         raise HTTPException(

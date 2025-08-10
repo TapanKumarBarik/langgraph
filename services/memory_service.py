@@ -4,34 +4,205 @@ import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import uuid
+import os
+from pathlib import Path
 
 from azure.storage.blob.aio import BlobServiceClient
+from azure.search.documents.aio import SearchClient
+from azure.core.credentials import AzureKeyCredential
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 from langchain.schema import BaseMessage, HumanMessage, AIMessage, SystemMessage
 import structlog
 
 logger = structlog.get_logger()
 
 class ConversationMemoryService:
-    def __init__(self, connection_string: str, container_name: str):
+    def __init__(
+        self,
+        use_local_storage: bool = False,
+        connection_string: str = "",
+        container_name: str = "conversations",
+        local_storage_path: str = "./local_storage/conversations"
+    ):
+        self.use_local_storage = use_local_storage
         self.connection_string = connection_string
         self.container_name = container_name
+        self.local_storage_path = local_storage_path
         self.blob_service_client = None
         self.container_client = None
-    
+        self.conversations = {}  # In-memory cache for conversations
+
     async def initialize(self):
-        """Initialize Azure AI Search client"""
+        """Initialize storage service"""
         try:
-            credential = AzureKeyCredential(self.api_key)
-            self.search_client = SearchClient(
-                endpoint=self.endpoint,
-                index_name=self.index_name,
-                credential=credential
-            )
-            logger.info("Azure AI Search service initialized")
+            if self.use_local_storage:
+                os.makedirs(self.local_storage_path, exist_ok=True)
+                logger.info("Local storage initialized", path=self.local_storage_path)
+            else:
+                logger.info("Azure Blob Storage initialized")
         except Exception as e:
-            logger.error("Failed to initialize Azure AI Search", error=str(e))
+            logger.error("Failed to initialize storage", error=str(e))
             raise
-    
+
+    async def save_conversation_turn(self, user_id: str, conversation_id: str, 
+                                   human_message: BaseMessage, ai_message: BaseMessage,
+                                   metadata: Dict[str, Any] = None) -> None:
+        """Save a conversation turn"""
+        try:
+            conversation_key = f"{user_id}:{conversation_id}"
+            
+            if conversation_key not in self.conversations:
+                self.conversations[conversation_key] = {
+                    "user_id": user_id,
+                    "conversation_id": conversation_id,
+                    "messages": [],
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+            
+            # Add messages
+            self.conversations[conversation_key]["messages"].extend([
+                {
+                    "type": "human",
+                    "content": human_message.content,
+                    "timestamp": datetime.utcnow().isoformat()
+                },
+                {
+                    "type": "ai", 
+                    "content": ai_message.content,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "metadata": metadata or {}
+                }
+            ])
+            
+            self.conversations[conversation_key]["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Persist to storage
+            await self._persist_conversation(user_id, conversation_id, self.conversations[conversation_key])
+            
+        except Exception as e:
+            logger.error("Failed to save conversation turn", error=str(e))
+            raise
+
+    async def get_conversation_history(self, user_id: str, conversation_id: str) -> List[BaseMessage]:
+        """Get conversation history as BaseMessage objects"""
+        try:
+            conversation_key = f"{user_id}:{conversation_id}"
+            
+            # Try cache first
+            if conversation_key in self.conversations:
+                conversation = self.conversations[conversation_key]
+            else:
+                # Load from storage
+                conversation = await self._load_conversation(user_id, conversation_id)
+                if conversation:
+                    self.conversations[conversation_key] = conversation
+            
+            if not conversation:
+                return []
+            
+            # Convert to BaseMessage objects
+            messages = []
+            for msg in conversation.get("messages", []):
+                if msg["type"] == "human":
+                    messages.append(HumanMessage(content=msg["content"]))
+                else:
+                    messages.append(AIMessage(content=msg["content"]))
+            
+            return messages
+            
+        except Exception as e:
+            logger.error("Failed to get conversation history", error=str(e))
+            return []
+
+    async def list_user_conversations(self, user_id: str, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+        """List conversations for a specific user"""
+        try:
+            # Load all conversations for user from storage if needed
+            await self._load_user_conversations(user_id)
+            
+            # Filter conversations for this user
+            user_conversations = []
+            for key, conv in self.conversations.items():
+                if conv.get("user_id") == user_id:
+                    user_conversations.append({
+                        "conversation_id": conv["conversation_id"],
+                        "created_at": conv["created_at"],
+                        "updated_at": conv["updated_at"],
+                        "message_count": len(conv.get("messages", [])),
+                        "last_message": conv.get("messages", [])[-1]["content"][:100] + "..." if conv.get("messages") else ""
+                    })
+            
+            # Sort by updated_at descending
+            user_conversations.sort(key=lambda x: x["updated_at"], reverse=True)
+            
+            # Apply pagination
+            return user_conversations[offset:offset + limit]
+            
+        except Exception as e:
+            logger.error("Failed to list user conversations", user_id=user_id, error=str(e))
+            return []
+
+    async def delete_conversation(self, user_id: str, conversation_id: str) -> None:
+        """Delete a conversation"""
+        try:
+            conversation_key = f"{user_id}:{conversation_id}"
+            
+            # Remove from cache
+            if conversation_key in self.conversations:
+                del self.conversations[conversation_key]
+            
+            # Remove from storage
+            if self.use_local_storage:
+                file_path = Path(self.local_storage_path) / user_id / f"{conversation_id}.json"
+                if file_path.exists():
+                    file_path.unlink()
+                    
+        except Exception as e:
+            logger.error("Failed to delete conversation", error=str(e))
+            raise
+
+    async def _persist_conversation(self, user_id: str, conversation_id: str, conversation: Dict[str, Any]) -> None:
+        """Persist conversation to storage"""
+        if self.use_local_storage:
+            user_dir = Path(self.local_storage_path) / user_id
+            user_dir.mkdir(exist_ok=True)
+            
+            file_path = user_dir / f"{conversation_id}.json"
+            with open(file_path, 'w') as f:
+                json.dump(conversation, f, indent=2)
+        else:
+            # Implement Azure Blob Storage persistence
+            pass
+
+    async def _load_conversation(self, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Load conversation from storage"""
+        if self.use_local_storage:
+            file_path = Path(self.local_storage_path) / user_id / f"{conversation_id}.json"
+            if file_path.exists():
+                with open(file_path, 'r') as f:
+                    return json.load(f)
+        else:
+            # Implement Azure Blob Storage loading
+            pass
+        return None
+
+    async def _load_user_conversations(self, user_id: str) -> None:
+        """Load all conversations for a user into cache"""
+        if self.use_local_storage:
+            user_dir = Path(self.local_storage_path) / user_id
+            if user_dir.exists():
+                for file_path in user_dir.glob("*.json"):
+                    conversation_id = file_path.stem
+                    conversation_key = f"{user_id}:{conversation_id}"
+                    
+                    if conversation_key not in self.conversations:
+                        conversation = await self._load_conversation(user_id, conversation_id)
+                        if conversation:
+                            self.conversations[conversation_key] = conversation
+
     async def search_documents(
         self, 
         query: str, 
@@ -45,7 +216,7 @@ class ConversationMemoryService:
                 "top": top,
                 "include_total_count": True,
                 "highlight_fields": "content",
-                "select": "id,title,content,metadata,image_data"
+                "select": "id,title,content,metadata"
             }
             
             if filters:
@@ -61,15 +232,11 @@ class ConversationMemoryService:
                     "content": result.get("content", ""),
                     "score": result.get("@search.score", 0),
                     "highlights": result.get("@search.highlights", {}),
-                    "metadata": result.get("metadata", {}),
-                    "image_data": result.get("image_data")
+                    "metadata": result.get("metadata", {})
                 }
                 documents.append(doc)
             
-            logger.info("Search completed", 
-                       query=query, 
-                       results_count=len(documents))
-            
+            logger.info("Search completed", query=query, results_count=len(documents))
             return documents
             
         except Exception as e:
@@ -79,13 +246,6 @@ class ConversationMemoryService:
     def extract_images_from_results(self, documents: List[Dict[str, Any]]) -> List[str]:
         """Extract image data from search results"""
         images = []
-        for doc in documents:
-            if doc.get("image_data"):
-                # Handle base64 encoded images
-                if isinstance(doc["image_data"], str):
-                    images.append(doc["image_data"])
-                elif isinstance(doc["image_data"], list):
-                    images.extend(doc["image_data"])
         return images
     
     def create_citations(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -103,8 +263,9 @@ class ConversationMemoryService:
         return citations
 
 class AzureSQLService:
-    def __init__(self, connection_string: str):
+    def __init__(self, connection_string: str, use_local: bool = False):
         self.connection_string = connection_string
+        self.use_local = use_local
         self.engine = None
         self.session_factory = None
         
@@ -135,21 +296,25 @@ class AzureSQLService:
     async def initialize(self):
         """Initialize SQL connection"""
         try:
-            # Convert connection string for async usage
-            async_conn_str = self.connection_string.replace(
-                "Driver={ODBC Driver", "Driver={ODBC Driver"
-            )
-            if "asyncio" not in async_conn_str:
-                async_conn_str = async_conn_str.replace(
+            if self.use_local:
+                # For local SQL Server Express
+                self.engine = create_async_engine(
+                    self.connection_string,
+                    echo=False,
+                    pool_pre_ping=True,
+                    pool_recycle=3600
+                )
+            else:
+                # For Azure SQL
+                async_conn_str = self.connection_string.replace(
                     "mssql+pyodbc://", "mssql+aiodbc://"
                 )
-            
-            self.engine = create_async_engine(
-                async_conn_str,
-                echo=False,
-                pool_pre_ping=True,
-                pool_recycle=3600
-            )
+                self.engine = create_async_engine(
+                    async_conn_str,
+                    echo=False,
+                    pool_pre_ping=True,
+                    pool_recycle=3600
+                )
             
             self.session_factory = sessionmaker(
                 self.engine, 
@@ -161,10 +326,10 @@ class AzureSQLService:
             async with self.engine.begin() as conn:
                 await conn.execute(text("SELECT 1"))
             
-            logger.info("Azure SQL service initialized")
+            logger.info("SQL service initialized", local=self.use_local)
             
         except Exception as e:
-            logger.error("Failed to initialize Azure SQL", error=str(e))
+            logger.error("Failed to initialize SQL", error=str(e))
             raise
     
     async def close(self):
@@ -174,7 +339,6 @@ class AzureSQLService:
     
     def _sanitize_sql_query(self, query: str) -> str:
         """Basic SQL injection protection"""
-        # Remove dangerous keywords
         dangerous_keywords = [
             "DROP", "DELETE", "INSERT", "UPDATE", "CREATE", "ALTER", 
             "EXEC", "EXECUTE", "sp_", "xp_", "TRUNCATE"
@@ -195,10 +359,8 @@ class AzureSQLService:
     ) -> List[Dict[str, Any]]:
         """Execute SQL query safely"""
         try:
-            # Sanitize query
             safe_query = self._sanitize_sql_query(query)
             
-            # Add LIMIT if not present
             if "TOP" not in safe_query.upper() and "LIMIT" not in safe_query.upper():
                 if safe_query.strip().upper().startswith("SELECT"):
                     safe_query = safe_query.replace("SELECT", f"SELECT TOP {max_results}", 1)
@@ -207,7 +369,6 @@ class AzureSQLService:
                 result = await session.execute(text(safe_query), params or {})
                 rows = result.fetchall()
                 
-                # Convert to list of dicts
                 columns = result.keys()
                 data = [dict(zip(columns, row)) for row in rows]
                 
@@ -232,3 +393,11 @@ class AzureSQLService:
     def get_all_tables_info(self) -> List[Dict[str, Any]]:
         """Get information about all available tables"""
         return [self.get_table_info(table) for table in self.table_schemas.keys()]
+
+    def get_adventureworks_sample_queries(self) -> List[str]:
+        """Get sample queries for AdventureWorks database"""
+        return [
+            "SELECT TOP 10 * FROM Person.Person",
+            "SELECT COUNT(*) FROM Sales.SalesOrderHeader",
+            "SELECT ProductID, Name, ListPrice FROM Production.Product WHERE ListPrice > 100"
+        ]
